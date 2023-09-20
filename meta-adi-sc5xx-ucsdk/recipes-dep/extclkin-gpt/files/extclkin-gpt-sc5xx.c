@@ -24,6 +24,7 @@
 #include <linux/timekeeping.h>
 #include <linux/mutex.h>
 #include <linux/preempt.h>
+#include <linux/soc/adi/hardware.h>
 #include <linux/uaccess.h>
 #include <linux/soc/adi/cpu.h>
 
@@ -56,6 +57,47 @@
 #define GPT_MASK               (1<<GPT_NO)
 #define SUCCESS                0
 #define READ_BUFFER_SIZE       (MAX_LINE_LENGTH + 1)    
+#define TIMER_GROUP            0x31018004
+
+
+/* =========================
+        TIMER0
+   ========================= */
+#define TIMER0_CONFIG	0x31018060
+
+/*
+ * Timer Configuration Register Bits
+  */
+#define TIMER_EMU_RUN       0x8000
+#define TIMER_BPER_EN       0x4000
+#define TIMER_BWID_EN       0x2000
+#define TIMER_BDLY_EN       0x1000
+#define TIMER_OUT_DIS       0x0800
+#define TIMER_TIN_SEL       0x0400
+#define TIMER_CLK_SEL       0x0300
+#define TIMER_CLK_SCLK      0x0000
+#define TIMER_CLK_ALT_CLK0  0x0100
+#define TIMER_CLK_ALT_CLK1  0x0300
+#define TIMER_PULSE_HI      0x0080
+#define TIMER_SLAVE_TRIG    0x0040
+#define TIMER_IRQ_MODE      0x0030
+#define TIMER_IRQ_ACT_EDGE  0x0000
+#define TIMER_IRQ_DLY       0x0010
+#define TIMER_IRQ_WID_DLY   0x0020
+#define TIMER_IRQ_PER       0x0030
+#define TIMER_MODE          0x000f
+#define TIMER_MODE_WDOG_P   0x0008
+#define TIMER_MODE_WDOG_W   0x0009
+#define TIMER_MODE_PWM_CONT 0x000c
+#define TIMER_MODE_PWM      0x000d
+#define TIMER_MODE_WDTH     0x000a
+#define TIMER_MODE_WDTH_D   0x000b
+#define TIMER_MODE_EXT_CLK  0x000e
+#define TIMER_MODE_PININT   0x000f
+
+
+
+#define __BFP(m) u16 m; u16 __pad_##m
 
 
 struct sc57x_extclkin_gpt {
@@ -69,7 +111,45 @@ struct sc57x_extclkin_gpt {
     u32 currCnt;
 };
 
+struct gptimerext_group_regs {
+	__BFP(run);
+	__BFP(enable);
+	__BFP(disable);
+	__BFP(stop_cfg);
+	__BFP(stop_cfg_set);
+	__BFP(stop_cfg_clr);
+	__BFP(data_imsk);
+	__BFP(stat_imsk);
+	__BFP(tr_msk);
+	__BFP(tr_ie);
+	__BFP(data_ilat);
+	__BFP(stat_ilat);
+	__BFP(err_status);
+	__BFP(bcast_per);
+	__BFP(bcast_wid);
+	__BFP(bcast_dly);
+};
 
+#define GPTIMER_OFFSET 0x20
+#define GET_TIMER_BASE(id) ((__io_address(TIMER0_CONFIG) + GPTIMER_OFFSET * id))
+#define GPTIMER_CFG_OFF   0x0
+#define GPTIMER_COUNT_OFF 0x4
+#define GPTIMER_PER_OFF   0x8
+#define GPTIMER_WID_OFF   0xC
+#define GPTIMER_DLY_OFF   0x10
+
+#define PORTB_MUX_REG_IO  __io_address(0x310040B0)
+#define PORTB_FER_REG_IO  __io_address(0x31004080)
+#define TMR3_MUX_ENABLE         (0<<6)
+#define TMR3_FER_ENABLE         (1<<3)
+
+#define TWI1_SCL_PORTB_FER  ((u16) ((u16) 1<<0))
+#define TWI1_SDA_PORTB_FER  ((u16) ((u16) 1<<1))
+
+#define TWI1_SCL_PORTB_MUX  ((u16) ((u16) 1<<0))
+#define TWI1_SDA_PORTB_MUX  ((u16) ((u16) 1<<2))
+
+static struct gptimerext_group_regs* const group_base = __io_address(TIMER_GROUP);
 static struct sc57x_extclkin_gpt extclkin_gpt;
 static struct sc5xx_gptimer *sc5xx_gpt;
 static char readBuf[READ_BUFFER_SIZE];
@@ -78,11 +158,19 @@ static char readBuf[READ_BUFFER_SIZE];
 static int device_open(struct inode *, struct file *);
 static int device_release(struct inode *, struct file *);
 static ssize_t device_read(struct file *, char *, size_t, loff_t *);
-//static inline volatile u32 reg_read(u32 address);
-//static inline void reg_write(u32 address, u32 value);
+static inline volatile u32 reg_read(u32 address);
+static inline void reg_write(u32 address, u32 value);
 static inline u32 get_count(u8 *rollover);
 
+////
+static bool gptimer_is_running(struct sc5xx_gptimer *timer) {
+	u32 stat = 0;////readw(gptimer_controller.base + GPTIMER_RUN);
+	u32 check = 1 << timer->id;
+	return (stat & check) == check;
+}
 
+
+////
 /* Protect state against multiple readers */
 DEFINE_MUTEX(accessTimer);
 
@@ -98,6 +186,31 @@ struct file_operations fops = {
     .release = device_release
 };
 
+/*
+ * Read a GPT register with the given address,
+ * returning the result. 
+ */
+static inline volatile u32 reg_read(u32 address)
+{
+    return (volatile u32) readl(address);
+}
+
+/*
+ * Read a GPT register(16bit wide) with the given address,
+ * returning the result. 
+ */
+static inline volatile u32 reg_read_short(u32 address)
+{
+    return (volatile u32) readw(address);
+}
+
+/*
+ * Write a GPT register with given address the given value. 
+ */
+static inline void reg_write(u32 address, u32 value)
+{
+   writel(value, address);
+}
 
 /*
  * Setups and enables the GPT to:
@@ -109,49 +222,83 @@ struct file_operations fops = {
 static inline void setup_gpt(void)
 {
     u32 regVal = 0;
+    u32 regAdr, status;
+    u8 tmp;
 
-/* 
-PB_03 set in sc598-som-ezkit.dts 
-*/
+    //if( GPT_NO == 1)
+    if( GPT_NO == 3)
+    {
+        //enable Mux
+        //Setting up mux
+        regAdr = PORTB_MUX_REG_IO;
+        regVal = reg_read(regAdr);
+        regVal |= TMR3_MUX_ENABLE | TWI1_SCL_PORTB_MUX | TWI1_SDA_PORTB_MUX;
+        reg_write(regAdr, regVal);
+        PRINTK_DBG("\n write PORTC MUX Reg address : %x, Reg value : %x", regAdr, regVal);   
+
+        regAdr = PORTB_FER_REG_IO;
+        regVal = reg_read(regAdr);
+        regVal |= TMR3_FER_ENABLE | TWI1_SCL_PORTB_FER | TWI1_SDA_PORTB_FER;
+        reg_write(regAdr, regVal);
+        PRINTK_DBG("\n write PORTC FER Reg address : %x, Reg value : %x", regAdr, regVal);
+    }
+	else
+	{
+		pr_err("Unsupported timer channel %d", GPT_NO);
+		return;
+	}
 
     //Confirming the whether timer is running or not
-    regVal = gptimer_is_running(sc5xx_gpt);	
-    PRINTK_DBG("\n Timer Run read  %d ", regVal);	
-    if(regVal)
+    regVal = reg_read_short(&group_base->run);
+	PRINTK_DBG("\n Timer Run %x read  %d ",&group_base->run, regVal);
+    if(regVal & GPT_MASK)
     {
-        PRINTK_DBG("\n Timer %d is running. Disable it.", GPT_NO);
+        PRINTK_DBG("\n Timer %d is running", GPT_NO);
+        PRINTK_DBG("\n Timer value :  %d ", get_count(&tmp));
+
         // Timer Run Clear
-		gptimer_disable(sc5xx_gpt);
+        regVal = (GPT_MASK);
+        regAdr = &group_base->disable;
+        reg_write(regAdr, regVal);
+
+        PRINTK_DBG("\n write GPT Run clear Reg address : %x, Reg value : %x", regAdr, regVal);
     }
 
     // Configure GPT CFG, external clock mode
     regVal = TIMER_MODE_EXT_CLK | TIMER_IRQ_PER;    
-    set_gptimer_config(sc5xx_gpt, regVal);    
-    PRINTK_DBG("\n write GPT CFG Reg value : 0x%x", regVal);      
+    regAdr = extclkin_gpt.io_base + GPTIMER_CFG_OFF;
+    reg_write(regAdr, regVal);
+
+    PRINTK_DBG("\n write GPT CFG Reg address : %x, Reg value : %x", regAdr, regVal);      
 
     // Set Period
     regVal = SECONDS_PER_ROLLOVER * frequency;
-    set_gptimer_period(sc5xx_gpt, regVal);
-    set_gptimer_pwidth(sc5xx_gpt, 0);	
-    PRINTK_DBG("\n write GPT PERIOD Reg value : 0x%x, WIDTH=0", regVal); 
+    regAdr = extclkin_gpt.io_base + GPTIMER_PER_OFF;
+    reg_write(regAdr, regVal);
+
+    PRINTK_DBG("\n write GPT PERIOD Reg address : %x, Reg value : %x", regAdr, regVal);
 
 #if ROLLOVER_DETECTION_BY_IRPT_LATCH
     //Data IMASK
-    regVal = get_gptimer_imask();	_to_be_added_ to kernel	
+    regAdr = &group_base->data_imsk;
+    regVal = reg_read_short(regAdr);
     regVal |= (GPT_MASK);
-    set_gptimer_imask(sc5xx_gpt);	_to_be_added_ to kernel
+    reg_write(regAdr, regVal);
 #endif
 
     // Timer Run SET
-    gptimer_enable(sc5xx_gpt);
-    PRINTK_DBG("\n write GPT Run to TIMER0_TMR[%d]", GPT_NO);
+    regVal = (GPT_MASK);
+    regAdr = &group_base->enable;
+    reg_write(regAdr, regVal);
+
+    PRINTK_DBG("\n write GPT Run set Reg address : %x, Reg value : %x", regAdr, regVal);
 
     //Confirming the whether timer is running or not
-    regVal = gptimer_is_running(sc5xx_gpt);	
-    if(regVal)
+    regVal = reg_read_short(&group_base->run);
+    if(regVal & GPT_MASK)
     {
         PRINTK_DBG("\n Timer %d is running", GPT_NO);
-        PRINTK_DBG("\n Current Timer value :  %d ", get_gptimer_count(sc5xx_gpt));
+        PRINTK_DBG("\n Current Timer value :  %d ", get_count(&tmp));
         PRINTK_DBG("\n Counter set up success");
     }
 
@@ -162,10 +309,13 @@ PB_03 set in sc598-som-ezkit.dts
  */
 static inline void stop_gpt(void)
 {
+    u32 regVal = (GPT_MASK);
     // Timer Clear
-    gptimer_disable(sc5xx_gpt);
+    reg_write(&group_base->disable, regVal);
+
     //Clear CFG
-    set_gptimer_config(sc5xx_gpt, 0);
+    regVal = 0;
+    reg_write(extclkin_gpt.io_base + GPTIMER_CFG_OFF, regVal);          // write back
 }
 
 /*
@@ -177,19 +327,20 @@ static inline void stop_gpt(void)
 static inline u32 get_count(u8 *rollover)
 {
     u32 count;
+    u32 status;
     // Get count from timer
-    count = get_gptimer_count(sc5xx_gpt);
+    count = reg_read(extclkin_gpt.io_base + GPTIMER_COUNT_OFF);
     
 #if ROLLOVER_DETECTION_BY_IRPT_LATCH  
     u32 status;
     // Check rollover
-    status = get_gptimer_status(sc5xx_gpt);	_to_be_added_ to kernel	
+    status = reg_read(&group_base->data_ilat);
     if (status & GPT_MASK) {
         *rollover = 1;
         // clear flag by writing 1 for rollover, and 0's for others as not clearing any other flags
-	set_gptimer_status(sc5xx_gpt);	_to_be_added_ to kernel	
+        reg_write(&group_base->data_ilat, GPT_MASK);
         // ensure it's clear
-	status = get_gptimer_status(sc5xx_gpt);	_to_be_added_ to kernel	
+        status = reg_read(&group_base->data_ilat);
         if (status & GPT_MASK) {
             dev_err(extclkin_gpt.thisDev, "can't clear rollover flag.\n");
         }
@@ -237,9 +388,11 @@ static int __init gpt_clkin_init(void)
     
     dev_dbg(extclkin_gpt.thisDev, "Driver %s got major number %d. Create a dev file with 'mknod /dev/%s c %d 0'.\n", DEVICE_NAME, extclkin_gpt.deviceMajor, DEVICE_NAME, extclkin_gpt.deviceMajor);
 
-    sc5xx_gpt = gptimer_request(GPT_NO);
 
-    if (sc5xx_gpt == NULL) {
+    //extclkin_gpt.io_base = ioremap_nocache(GET_TIMER_BASE(GPT_NO), GPTIMER_OFFSET);
+    extclkin_gpt.io_base = GET_TIMER_BASE(GPT_NO);
+
+    if (!extclkin_gpt.io_base) {
         dev_err(extclkin_gpt.thisDev, "Can't ioremap memory for GPT\n");
         device_destroy(extclkin_gpt.devClass, extclkin_gpt.devNo);
         class_destroy(extclkin_gpt.devClass);
@@ -364,7 +517,7 @@ static ssize_t device_read(struct file *filp,   /* ref: include/linux/fs.h   */
         // if user buffer length isn't enough, log this and return no bytes
         if (length < READ_BUFFER_SIZE) 
         {
-           dev_warn(extclkin_gpt.thisDev, "Device %s: read request had insufficient buffer size of %ld. Minimum required is %ld.\n", DEVICE_NAME, length, READ_BUFFER_SIZE);
+           dev_warn(extclkin_gpt.thisDev, "Device %s: read request had insufficient buffer size of %ld. Minimum required is %d.\n", DEVICE_NAME, length, READ_BUFFER_SIZE);
             return -EINVAL;
         }
     
@@ -392,4 +545,4 @@ module_exit(gpt_clkin_exit);
 MODULE_LICENSE(DRIVER_LICENSE);
 MODULE_AUTHOR(DRIVER_AUTHOR);
 MODULE_DESCRIPTION(DRIVER_DESC);
-MODULE_SUPPORTED_DEVICE(DEVICE_NAME);
+//MODULE_SUPPORTED_DEVICE(DEVICE_NAME);
