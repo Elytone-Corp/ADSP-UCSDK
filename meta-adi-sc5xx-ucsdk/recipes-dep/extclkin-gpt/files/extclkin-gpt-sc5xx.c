@@ -163,7 +163,7 @@ static inline void reg_write(u32 address, u32 value);
 static inline u32 get_count(u8 *rollover);
 
 ////
-static bool gptimer_is_running(struct sc5xx_gptimer *timer) {
+bool gptimer_is_running(struct sc5xx_gptimer *timer) {
 	u32 stat = 0;////readw(gptimer_controller.base + GPTIMER_RUN);
 	u32 check = 1 << timer->id;
 	return (stat & check) == check;
